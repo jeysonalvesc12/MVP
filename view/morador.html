@@ -1842,6 +1842,9 @@
                 (position) => {
                     const lat = position.coords.latitude;
                     const lng = position.coords.longitude;
+                    // Armazena coordenadas para envio à API ao cadastrar ocorrência
+                    window._latAtual = lat;
+                    window._lngAtual = lng;
                     fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&addressdetails=1&accept-language=pt-BR`)
                         .then(response => response.json())
                         .then(data => {
@@ -2433,38 +2436,166 @@
         // ============================================
         // SALVAR OCORRÊNCIA
         // ============================================
-        function saveOccurrence() {
+        // URL base da API Flask — altere se o servidor rodar em outra porta
+        const API_URL = 'http://localhost:5000/api';
+
+        // ============================================
+        // CADASTRO DE OCORRÊNCIA — integrado à API
+        // ============================================
+        async function saveOccurrence() {
             showLoading();
-            setTimeout(() => {
-                const titulo = document.getElementById('occTitulo')?.value || '';
-                const descricao = document.getElementById('occDescricao')?.value || '';
-                const endereco = document.getElementById('occEndereco')?.value || '';
-                const urgencia = document.getElementById('occUrgencia')?.value || 'medio';
-                let bairro = 'Centro';
-                if (endereco.includes('Centro')) bairro = 'Centro';
-                else if (endereco.includes('Jardim Brasília')) bairro = 'Jardim Brasília';
-                else if (endereco.includes('Botujuru')) bairro = 'Botujuru';
-                else if (endereco.includes('Santa Maria')) bairro = 'Santa Maria';
-                
-                const nova = { id: Date.now(), titulo, descricao, endereco, bairro, status: 'pendente', urgencia, data: new Date().toISOString(), moradorId: currentUser.id, agenteStatus: null, fotos: [...fotosTemp], avaliacao: null, lat: -23.207, lng: -46.77 };
-                
-                if (!isOnline()) {
-                    const pending = JSON.parse(localStorage.getItem('simad_pending_occurrences') || '[]');
-                    pending.push(nova);
-                    localStorage.setItem('simad_pending_occurrences', JSON.stringify(pending));
-                    showToast('Sem internet. Ocorrência salva localmente e será enviada quando a conexão for restaurada.', 'warning');
-                } else {
-                    ocorrencias.unshift(nova);
-                    saveData();
-                    showToast('Ocorrência registrada com sucesso', 'success');
-                    mostrarNotificacao('Nova ocorrência', `${titulo} - ${endereco}`);
-                }
-                closeModal('newOccurrenceModal');
-                const activePage = document.querySelector('.tab.active')?.getAttribute('data-page');
-                if (activePage === 'home') renderHome();
-                else if (activePage === 'ocorrencias') filterOcorrencias();
+
+            const titulo    = document.getElementById('occTitulo')?.value?.trim() || '';
+            const descricao = document.getElementById('occDescricao')?.value?.trim() || '';
+            const cep       = document.getElementById('occCep')?.value?.trim() || '';
+            const endereco  = document.getElementById('occEndereco')?.value?.trim() || '';
+            const urgencia  = document.getElementById('occUrgencia')?.value || 'medio';
+
+            // Extrai bairro a partir do endereço (lógica original mantida)
+            let bairro = 'Centro';
+            if (endereco.includes('Jardim Brasília')) bairro = 'Jardim Brasília';
+            else if (endereco.includes('Botujuru'))    bairro = 'Botujuru';
+            else if (endereco.includes('Santa Maria')) bairro = 'Santa Maria';
+            else if (endereco.includes('Centro'))      bairro = 'Centro';
+
+            // Coordenadas capturadas pelo botão "Usar localização atual"
+            const latitude  = window._latAtual  || null;
+            const longitude = window._lngAtual  || null;
+
+            // Validações mínimas
+            if (!titulo) {
                 hideLoading();
-            }, 500);
+                showToast('Informe o título da ocorrência.', 'error');
+                return;
+            }
+            if (descricao.length < 20) {
+                hideLoading();
+                showToast('A descrição deve ter pelo menos 20 caracteres.', 'error');
+                return;
+            }
+
+            const dadosOcorrencia = {
+                titulo,
+                descricao,
+                tipo_ocorrencia: 'Geral', // TODO: adicionar campo tipo no formulário
+                cep,
+                endereco,
+                bairro,
+                cidade: 'Campo Limpo Paulista', // TODO: preencher via CEP quando disponível
+                estado: 'SP',
+                latitude,
+                longitude,
+                urgencia,
+                id_morador: currentUser?.id || 1,
+            };
+
+            // Sem internet: salva localmente para sincronizar depois
+            if (!isOnline()) {
+                const pendentes = JSON.parse(localStorage.getItem('simad_pending_occurrences') || '[]');
+                pendentes.push({ ...dadosOcorrencia, _pendente: true, data_criacao: new Date().toISOString() });
+                localStorage.setItem('simad_pending_occurrences', JSON.stringify(pendentes));
+                showToast('Sem internet. Ocorrência salva localmente e será enviada quando a conexão for restaurada.', 'warning');
+                hideLoading();
+                closeModal('newOccurrenceModal');
+                return;
+            }
+
+            try {
+                const resposta = await fetch(`${API_URL}/ocorrencias`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(dadosOcorrencia),
+                });
+                const resultado = await resposta.json();
+                if (!resposta.ok) throw new Error(resultado.erro || 'Erro ao cadastrar ocorrência');
+
+                showToast('Ocorrência registrada com sucesso!', 'success');
+                mostrarNotificacao('Nova ocorrência', `${titulo} — ${endereco}`);
+                closeModal('newOccurrenceModal');
+
+                // Recarrega lista atualizada do banco
+                await carregarOcorrenciasMorador();
+
+                const paginaAtiva = document.querySelector('.tab.active')?.getAttribute('data-page');
+                if (paginaAtiva === 'home') renderHome();
+                else if (paginaAtiva === 'ocorrencias') filterOcorrencias();
+
+            } catch (erro) {
+                showToast(`Erro: ${erro.message}`, 'error');
+                console.error('Erro ao cadastrar ocorrência:', erro);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        // ============================================
+        // CONSULTA DE OCORRÊNCIAS DO MORADOR — API
+        // ============================================
+        async function carregarOcorrenciasMorador() {
+            const id_morador = currentUser?.id || 1;
+            try {
+                const resposta = await fetch(`${API_URL}/ocorrencias/morador/${id_morador}`);
+                const dados    = await resposta.json();
+                if (!resposta.ok) throw new Error(dados.erro || 'Erro ao buscar ocorrências');
+
+                // Mapeia campos da API para o formato usado pelas funções de render
+                ocorrencias = dados.map(o => ({
+                    id:          o.id,
+                    titulo:      o.titulo,
+                    descricao:   o.descricao,
+                    endereco:    o.endereco    || '',
+                    bairro:      o.bairro      || '',
+                    status:      o.status,
+                    urgencia:    o.urgencia    || 'medio',
+                    data:        o.data_criacao,
+                    moradorId:   o.id_morador,
+                    agenteStatus: o.observacao_agente || null,
+                    fotos:       [],
+                    avaliacao:   null,
+                    lat:         o.latitude   || -23.207,
+                    lng:         o.longitude  || -46.77,
+                }));
+
+                saveData(); // mantém cópia local como fallback offline
+            } catch (erro) {
+                console.error('Erro ao carregar ocorrências:', erro);
+                showToast('Não foi possível carregar do servidor. Usando dados locais.', 'warning');
+                loadSavedData(); // fallback: dados do localStorage
+            }
+        }
+
+        // ============================================
+        // SINCRONIZA OCORRÊNCIAS PENDENTES (offline→online)
+        // ============================================
+        async function syncPendingOccurrences() {
+            const pendentes = JSON.parse(localStorage.getItem('simad_pending_occurrences') || '[]');
+            if (pendentes.length === 0) return;
+
+            let sincronizadas = 0;
+            const falhas = [];
+
+            for (const ocorrencia of pendentes) {
+                try {
+                    const { _pendente, data_criacao, ...dadosLimpos } = ocorrencia;
+                    const resposta = await fetch(`${API_URL}/ocorrencias`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(dadosLimpos),
+                    });
+                    if (resposta.ok) sincronizadas++;
+                    else falhas.push(ocorrencia);
+                } catch {
+                    falhas.push(ocorrencia);
+                }
+            }
+
+            localStorage.setItem('simad_pending_occurrences', JSON.stringify(falhas));
+
+            if (sincronizadas > 0) {
+                showToast(`${sincronizadas} ocorrência(s) sincronizada(s) com sucesso!`, 'success');
+                await carregarOcorrenciasMorador();
+                renderOcorrencias();
+            }
         }
         
         function saveData() {
@@ -2482,9 +2613,10 @@
         // ============================================
         // INICIALIZAÇÃO
         // ============================================
-        function init() {
+        async function init() {
             if (!loadUser()) return;
-            loadSavedData();
+            loadSavedData(); // carrega localStorage como fallback enquanto a API responde
+            await carregarOcorrenciasMorador(); // busca ocorrências reais do backend
             renderHome();
             renderMonitoramento();
             renderOcorrencias();
@@ -2495,7 +2627,11 @@
             initConnectionStatus();
             setupKeyboardShortcuts();
             
-            window.addEventListener('online', () => { updateOfflineStatus(); showToast('Conexão restaurada!', 'success'); });
+            window.addEventListener('online', () => {
+                updateOfflineStatus();
+                showToast('Conexão restaurada!', 'success');
+                syncPendingOccurrences(); // envia ocorrências salvas offline
+            });
             window.addEventListener('offline', updateOfflineStatus);
             updateOfflineStatus();
         }
